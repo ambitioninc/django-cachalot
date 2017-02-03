@@ -169,7 +169,6 @@ def check_parameter_types(params):
                 raise UncachableQuery
 
 
-@LRUCache(max_size=10000)
 def get_encoded_cache_key(cache_key):
     """
     Get the encoded version of a cache key while storing it in the lru cache so we do not have to regenerate common
