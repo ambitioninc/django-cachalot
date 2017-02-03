@@ -2,6 +2,7 @@
 
 from __future__ import unicode_literals
 import datetime
+from collections import OrderedDict
 from decimal import Decimal
 from hashlib import sha1
 from time import time
@@ -12,7 +13,7 @@ from django.db import connections
 from django.db.models.sql import Query
 from django.db.models.sql.where import ExtraWhere, SubqueryConstraint
 from django.utils.module_loading import import_string
-from django.utils.six import text_type, binary_type
+from django.utils.six import text_type, binary_type, wraps
 
 from .settings import cachalot_settings
 from .transaction import AtomicCache
@@ -48,6 +49,114 @@ else:
         NumericRange, DateRange, DateTimeRange, DateTimeTZRange, Inet, Json))
 
 
+class LRUCache(object):
+    """
+    A simple LRU cache decorator.
+    (Until we port to Python3 and can used baked-in version)
+
+    *IMPORTANT: This decorator does not support **kwargs ! (but it could with a little more work)
+
+    Usage:
+        @LRUCache(max_size=1000)
+        def my_function(...)
+
+        or
+
+        class MyClass(object):
+            @LRUCache(max_size=1000)
+            def my_method(self, ...)
+
+    The overall strategy here is to hold the cache in an ordered dict.  Whenever an item
+    is accessed, it is moved to the front of the dict.  When the number of keys gets
+    too big, an item is popped of the back of the list to make room.  This guarentees
+    removal of the most stale object.
+    """
+    def __init__(self, max_size=1000):
+        """
+        No more than max_size values will be cached
+        """
+        self._max_size = max_size
+        self._od = OrderedDict()
+
+    def __setitem__(self, key, value):
+        """
+        This will only get called if the cache doesn't contain the key
+        """
+        # If the number of elements exceeds cache size, pop off the
+        # most stagnant cache value
+        if len(self._od) >= self._max_size:
+            self._od.popitem(last=False)[0][0]
+
+        # add the current key to the cache
+        self._od[key] = value
+
+    def clear_cache(self):
+        self._od = OrderedDict()
+
+    def cache_size(self):
+        return len(self._od)
+
+    def cache_dict(self):
+        return self._od
+
+    def __getitem__(self, key):
+        """
+        Method for accessing the cache
+        """
+        # remove the value from the cache if it's in there.  This will ensure
+        # that when values are accessed they always get pushed into the most
+        # recently accessed spot.
+        value = self._od.pop(key, None)
+
+        # if it wasn't in there, use the decorated callable to compute it
+        if value is None:
+            value = self._call_back(*key)
+
+        # add the computed value (back) to the most recently accessed spot in the cache
+        self[key] = value
+        return value
+
+    def __call__(self, call_back):
+        """
+        This method returns the decorated callable
+        """
+        # the other methods in this class need to know what the callback is, so set it here
+        self._call_back = call_back
+
+        # this is the wrapped callable that will be returned
+        def wrapper(*args, **kwargs):
+            # catch error for (currently) unsupported kwargs
+            if len(kwargs) > 0:
+                raise ValueError('LRUCache does not support kwargs')
+
+            # return cached values or compute uncached values
+            return self[args]
+
+        # assign attributes to the wrapper function that can be accessed in the calling code
+        wrapper.clear_cache = self.clear_cache
+        wrapper.cache_size = self.cache_size
+        wrapper.cache_dict = self.cache_dict
+        return wrapper
+
+
+def memoize(function):
+    """
+    A decorator for caching a response from a function
+    :param function:
+    :return:
+    """
+    memo = {}
+    @wraps(function)
+    def wrapper(*args):
+        if args in memo:
+            return memo[args]
+        else:
+            rv = function(*args)
+            memo[args] = rv
+            return rv
+    return wrapper
+
+
 def check_parameter_types(params):
     for p in params:
         cl = p.__class__
@@ -58,6 +167,27 @@ def check_parameter_types(params):
                 check_parameter_types(p.items())
             else:
                 raise UncachableQuery
+
+
+@LRUCache(max_size=10000)
+def get_encoded_cache_key(cache_key):
+    """
+    Get the encoded version of a cache key while storing it in the lru cache so we do not have to regenerate common
+    keys
+    :param cache_key:
+    :return:
+    """
+    return sha1(cache_key.encode('utf-8')).hexdigest()
+
+
+@memoize
+def get_keygen(keygen_path):
+    """
+    Get the python object from the keygen path and cache it so we arent importing each time
+    :param keygen_path:
+    :return:
+    """
+    return import_string(keygen_path)
 
 
 def get_query_cache_key(compiler):
@@ -76,7 +206,7 @@ def get_query_cache_key(compiler):
     sql, params = compiler.as_sql()
     check_parameter_types(params)
     cache_key = '%s:%s:%s' % (compiler.using, sql, params)
-    return sha1(cache_key.encode('utf-8')).hexdigest()
+    return get_encoded_cache_key(cache_key)
 
 
 def get_table_cache_key(db_alias, table):
@@ -91,20 +221,25 @@ def get_table_cache_key(db_alias, table):
     :rtype: int
     """
     cache_key = '%s:%s' % (db_alias, table)
-    return sha1(cache_key.encode('utf-8')).hexdigest()
+    return get_encoded_cache_key(cache_key)
 
 
 def _get_query_cache_key(compiler):
-    return import_string(cachalot_settings.CACHALOT_QUERY_KEYGEN)(compiler)
+    return get_keygen(cachalot_settings.CACHALOT_QUERY_KEYGEN)(compiler)
 
 
 def _get_table_cache_key(db_alias, table):
-    return import_string(cachalot_settings.CACHALOT_TABLE_KEYGEN)(db_alias, table)
+    return get_keygen(cachalot_settings.CACHALOT_TABLE_KEYGEN)(db_alias, table)
 
 
 def _get_tables_from_sql(connection, lowercased_sql):
-    return [t for t in connection.introspection.django_table_names()
+    return [t for t in _get_django_table_names(connection)
             if t in lowercased_sql]
+
+
+@memoize
+def _get_django_table_names(connection):
+    return connection.introspection.django_table_names()
 
 
 def _find_subqueries(children):
