@@ -1,6 +1,6 @@
 from django.apps import AppConfig
 from django.conf import settings
-from django.core.checks import register, Tags, Error
+from django.core.checks import register, Tags, Error, Warning
 
 from .monkey_patch import patch
 from .settings import cachalot_settings
@@ -49,7 +49,7 @@ def check_compatibility(app_configs, **kwargs):
             value = config[k]
             if value not in valid_values:
                 errors.append(
-                    Error(
+                    Warning(
                         '`%s` is not compatible with django-cachalot.' % value,
                         id='cachalot.E001',
                     )
