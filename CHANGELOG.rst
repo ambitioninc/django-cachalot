@@ -1,6 +1,12 @@
 What’s new in django-cachalot?
 ==============================
 
+1.4.2
+-----
+
+- Hard-coded class path comparisons for compatibility in django app checks only yield warnings, since there's not
+  a good way to maintain current performance and support super cache backend types
+
 1.4.1
 -----
 
